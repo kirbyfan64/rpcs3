@@ -21,6 +21,9 @@
 #include "XInputPadHandler.h"
 #include "MMJoystickHandler.h"
 #endif
+#ifdef __linux__
+#include "LinuxJoystickHandler.h"
+#endif
 
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/GL/GLGSRender.h"
@@ -90,6 +93,9 @@ cfg::map_entry<std::function<std::shared_ptr<PadHandlerBase>()>> g_cfg_pad_handl
 #ifdef _MSC_VER
 	{ "XInput", &std::make_shared<XInputPadHandler> },
 	{ "MMJoystick", &std::make_shared<MMJoystickHandler>},
+#endif
+#ifdef __linux_
+	{ "LinuxJoystick", &std::make_shared<LinuxJoystickHandler>},
 #endif
 });
 
