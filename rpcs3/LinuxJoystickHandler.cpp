@@ -1,13 +1,9 @@
-// JOYSTICK API DOCUMENTATION: https://www.kernel.org/doc/Documentation/input/joystick-api.txt
-
 #ifdef __linux__
 
 #include "LinuxJoystickHandler.h"
 #include "Utilities/Thread.h"
 #include "Utilities/Log.h"
 
-#include <linux/joystick.h>
-#include <sys/select.h>
 #include <functional>
 #include <algorithm>
 #include <unistd.h>
@@ -16,11 +12,17 @@
 #include <cstring>
 #include <cstdio>
 
-namespace {
+LinuxJoystickConfig g_linux_joystick_config;
+
+namespace
+{
     const u32 THREAD_SLEEP = 10;
     const u32 THREAD_SLEEP_INACTIVE = 100;
     const u32 READ_TIMEOUT = 10;
     const u32 THREAD_TIMEOUT = 1000;
+
+    const std::string EVENT_JOYSTICK = "event-joystick";
+    const std::string THREAD_NAME = "linux-joystick-handler";
 
     // From XInputPadHandler.cpp
     inline u16 ConvertAxis(short value)
@@ -32,19 +34,32 @@ namespace {
     inline u32 milli2nano(u32 milli) { return milli * 1000000; }
 }
 
-LinuxJoystickConfig g_linux_joystick_config;
-
 LinuxJoystickHandler::LinuxJoystickHandler() {}
 
 LinuxJoystickHandler::~LinuxJoystickHandler() { Close(); }
 
-void LinuxJoystickHandler::Init(const u32 max_connect) {
+void LinuxJoystickHandler::Init(const u32 max_connect)
+{
     std::memset(&m_info, 0, sizeof m_info);
     m_info.max_connect = std::min(max_connect, static_cast<u32>(1));
 
-    for (u32 i = 0; i < m_info.max_connect; ++i) {
-        joy_fds.push_back(-1);
-        joy_paths.emplace_back(fmt::format("/dev/input/js%d", i));
+    g_linux_joystick_config.load();
+
+    fs::dir devdir{"/dev/input/by-id"};
+    fs::dir_entry et;
+
+    while (devdir.read(et)) {
+        // Does the entry name end with event-joystick?
+        if (et.name.compare(et.name.size() - EVENT_JOYSTICK.size(),
+                            EVENT_JOYSTICK.size(), EVENT_JOYSTICK) == 0)
+        {
+            joy_paths.emplace_back(fmt::format("/dev/input/by-name/%s", et.name));
+        }
+    }
+
+    for (u32 i = 0; i < m_info.max_connect; ++i)
+    {
+        joy_devs.push_back(nullptr);
         m_pads.emplace_back(
             CELL_PAD_STATUS_DISCONNECTED,
             CELL_PAD_SETTING_PRESS_OFF | CELL_PAD_SETTING_SENSOR_OFF,
@@ -78,47 +93,59 @@ void LinuxJoystickHandler::Init(const u32 max_connect) {
         pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y, 0, 0);
     }
 
-    update_fds();
-    thread_ctrl::spawn(std::string{thread_name},
-                       std::bind(&LinuxJoystickHandler::thread_func, this));
+    update_devs();
+    thread_ctrl::spawn(THREAD_NAME, std::bind(&LinuxJoystickHandler::thread_func, this));
 }
 
-void LinuxJoystickHandler::update_fds() {
+void LinuxJoystickHandler::update_devs()
+{
     int connected=0;
 
     for (u32 i = 0; i < m_info.max_connect; ++i)
-        if (try_open_fd(joy_fds.size()-1)) ++connected;
+        if (try_open_dev(i)) ++connected;
 
     m_info.now_connect = connected;
 }
 
-bool LinuxJoystickHandler::try_open_fd(u32 index) {
-    auto& fd = joy_fds[index];
-    bool was_connected = fd != -1;
+bool LinuxJoystickHandler::try_open_dev(u32 index)
+{
+    libevdev*& dev = joy_devs[index];
+    bool was_connected = dev != nullptr;
 
     const auto& path = joy_paths[index];
 
-    if (!fs::exists(path)) {
+    if (!fs::exists(path))
+    {
         if (was_connected)
             // It was disconnected.
             m_pads[index].m_port_status |= CELL_PAD_STATUS_ASSIGN_CHANGES;
         m_pads[index].m_port_status &= ~CELL_PAD_STATUS_CONNECTED;
         LOG_ERROR(GENERAL, "Joystick %s is not present [previous status: %d]", path.c_str(),
                   was_connected ? 1 : 0);
-        fd = -1;
+        int fd = libevdev_get_fd(dev);
+        libevdev_free(dev);
+        close(fd);
         return false;
     }
 
     if (was_connected) return true;  // It's already been connected, and the js is still present.
-    fd = open(path.c_str(), O_RDONLY);
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
 
-    if (fd == -1) {
+    if (fd == -1)
+    {
         int err = errno;
-        LOG_ERROR(GENERAL, "Failed to open joystick: %s [errno %d]", strerror(err), err);
+        LOG_ERROR(GENERAL, "Failed to open joystick #%d: %s [errno %d]", index, strerror(err), err);
         return false;
     }
 
-    LOG_NOTICE(GENERAL, "Opened joystick at %s (fd %d)", path, fd);
+    int ret = libevdev_new_from_fd(fd, &dev);
+    if (ret < 0)
+    {
+        LOG_ERROR(GENERAL, "Failed to initialize libevdev for joystick #%d: %s [errno %d]", index, strerror(-ret), -ret);
+        return false;
+    }
+
+    LOG_NOTICE(GENERAL, "Opened joystick #%d '%s' at %s (fd %d)", index, libevdev_get_name(dev), path, fd);
 
     if (!was_connected)
         // Connection status changed from disconnected to connected.
@@ -127,64 +154,71 @@ bool LinuxJoystickHandler::try_open_fd(u32 index) {
     return true;
 }
 
-void LinuxJoystickHandler::Close() {
-    if (active.load()) {
+void LinuxJoystickHandler::Close()
+{
+    if (active.load())
+    {
         active.store(false);
         if (!dead.load())
             if (!thread_ctrl::wait_for(milli2nano(THREAD_TIMEOUT)))
                 LOG_ERROR(GENERAL, "LinuxJoystick thread could not stop within %d milliseconds", THREAD_TIMEOUT);
         dead.store(false);
     }
+
+    for (auto& dev : joy_devs)
+    {
+        if (dev != nullptr)
+        {
+            int fd = libevdev_get_fd(dev);
+            libevdev_free(dev);
+            close(fd);
+        }
+    }
 }
 
-void LinuxJoystickHandler::thread_func() {
+void LinuxJoystickHandler::thread_func()
+{
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = milli2nano(READ_TIMEOUT);
 
-    while (active) {
-        update_fds();
+    while (active)
+    {
+        update_devs();
 
-        fd_set fds_to_wait;
-        int max=0;
-        FD_ZERO(&fds_to_wait);
-
-        for (int fd : joy_fds) {
-            if (fd == -1) continue;
-            FD_SET(fd, &fds_to_wait);
-            max = std::max(max, fd);
-        }
-
-        // Query which joysticks are ready for reading.
-        pselect(max+1, &fds_to_wait, NULL, NULL, &ts, NULL);
-
-        for (int i=0; i<joy_fds.size(); i++) {
+        for (int i=0; i<joy_devs.size(); i++)
+        {
             auto& pad = m_pads[i];
-            int fd = joy_fds[i];
-            auto& path = joy_paths[i];
+            auto& dev = joy_devs[i];
+            if (dev == nullptr) continue;
 
-            // Skip if not connected or not ready for reading.
-            if (fd == -1 || !FD_ISSET(fd, &fds_to_wait)) continue;
+            // Try to query the latest event from the joystick.
+            input_event evt;
+            int ret = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &evt);
 
-            // Joystick is open: try reading a message from it.
-            struct js_event evt;
-            if (read(fd, &evt, sizeof(evt)) == -1) {
-                int err = errno;
-                // NOTE: ENODEV == joystick unplugged
-                LOG_ERROR(GENERAL, "Failed to read joystick %s: %s [errno %d]",
-                          path.c_str(), strerror(err), err);
+            // Grab any pending sync event.
+            if (ret == LIBEVDEV_READ_STATUS_SYNC)
+            {
+                ret = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL | LIBEVDEV_READ_FLAG_SYNC, &evt);
+            }
+
+            if (ret < 0)
+            {
+                // -EAGAIN signifies no available events, not an actual *error*.
+                if (ret != -EAGAIN)
+                    LOG_ERROR(GENERAL, "Failed to read latest event from joystick #%d: %s [errno %d]", i, strerror(-ret), -ret);
                 continue;
             }
 
-            // Event message was succesfully read. Mask out JS_EVENT_INIT, because it doesn't really matter.
-            evt.type &= ~JS_EVENT_INIT;
-
-            switch (evt.type) {
-            case JS_EVENT_BUTTON: {
+            switch (evt.type)
+            {
+            case EVT_KEY:
+            {
                 auto which_button = std::find_if(
                     pad.m_buttons.begin(), pad.m_buttons.end(),
                     [&](const Button& bt) { return bt.m_keyCode == evt.number; });
-                if (which_button == pad.m_buttons.end()) {
+                if (which_button == pad.m_buttons.end())
+                {
                     LOG_ERROR(GENERAL, "Joystick %s sent button event for invalid button %d",
                               path.c_str(), evt.number);
                     break;
@@ -194,17 +228,21 @@ void LinuxJoystickHandler::thread_func() {
                 which_button->m_value = evt.value ? 255 : 0;
                 break;
             }
-            case JS_EVENT_AXIS:
-                // Joystick event axis #'s should correspond with rpcs3's.
-                if (evt.number > pad.m_sticks.size()) {
-                    LOG_ERROR(GENERAL, "Joystick %s sent axis event for invalid axis %d",
-                              path.c_str(), evt.number);
+            case EVT_ABS: {
+                if (evt.code > ABS_HAT3Y || evt.code < ABS_HAT0X) break;
+                int axis = evt.code - ABS_HAT0X;
+
+                if (axis > pad.m_sticks.size())
+                {
+                    LOG_ERROR(GENERAL, "Joystick #%d sent axis event for invalid axis %d", i, axis);
+                    break;
                 }
 
-                pad.m_sticks[evt.number].m_value = ConvertAxis(evt.value);
+                pad.m_sticks[axis].m_value = ConvertAxis(evt.value);
                 break;
+            }
             default:
-                LOG_ERROR(GENERAL, "Unknown joystick %s event %d", path.c_str(), evt.type);
+                LOG_ERROR(GENERAL, "Unknown joystick #%d event %d", i, evt.type);
                 break;
             }
         }
