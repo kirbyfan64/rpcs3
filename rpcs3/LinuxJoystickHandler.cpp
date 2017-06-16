@@ -23,15 +23,10 @@ namespace
 
     const std::string EVENT_JOYSTICK = "event-joystick";
 
-    // From XInputPadHandler.cpp
-    inline u16 ConvertAxis(short value)
-    {
-        return static_cast<u16>((value + 32768l) >> 8);
-    }
-
     inline u32 milli2micro(u32 milli) { return milli * 1000; }
-    inline u32 milli2nano(u32 milli) { return milli * 1000000; }
 }
+
+enum { DPAD_AXIS_X = -1, DPAD_AXIS_Y = -2 };
 
 LinuxJoystickHandler::LinuxJoystickHandler() {}
 
@@ -49,17 +44,20 @@ void LinuxJoystickHandler::Init(const u32 max_connect)
 
     while (devdir.read(et)) {
         // Does the entry name end with event-joystick?
-        if (et.name.compare(et.name.size() - EVENT_JOYSTICK.size(),
+        if (et.name.size() > EVENT_JOYSTICK.size() &&
+            et.name.compare(et.name.size() - EVENT_JOYSTICK.size(),
                             EVENT_JOYSTICK.size(), EVENT_JOYSTICK) == 0)
         {
-            joy_paths.emplace_back(fmt::format("/dev/input/by-name/%s", et.name));
+            joy_paths.emplace_back(fmt::format("/dev/input/by-id/%s", et.name));
         }
     }
 
     for (u32 i = 0; i < m_info.max_connect; ++i)
     {
         joy_devs.push_back(nullptr);
+        joy_axis_maps.emplace_back(ABS_RZ - ABS_X, -1);
         joy_button_maps.emplace_back(KEY_MAX - BTN_JOYSTICK, -1);
+        joy_hat_ids.emplace_back(-1);
         m_pads.emplace_back(
             CELL_PAD_STATUS_DISCONNECTED,
             CELL_PAD_SETTING_PRESS_OFF | CELL_PAD_SETTING_SENSOR_OFF,
@@ -82,19 +80,20 @@ void LinuxJoystickHandler::Init(const u32 max_connect)
         pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, g_linux_joystick_config.r3, CELL_PAD_CTRL_R3);
         pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, 0, 0x100/*CELL_PAD_CTRL_PS*/);// TODO: PS button support
 
-        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, g_linux_joystick_config.up, CELL_PAD_CTRL_UP);
-        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, g_linux_joystick_config.down, CELL_PAD_CTRL_DOWN);
-        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, g_linux_joystick_config.left, CELL_PAD_CTRL_LEFT);
-        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, g_linux_joystick_config.right, CELL_PAD_CTRL_RIGHT);
+        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, DPAD_AXIS_Y, CELL_PAD_CTRL_UP);
+        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, DPAD_AXIS_Y, CELL_PAD_CTRL_DOWN);
+        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, DPAD_AXIS_X, CELL_PAD_CTRL_LEFT);
+        pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, DPAD_AXIS_X, CELL_PAD_CTRL_RIGHT);
 
-        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X, 0, 0);
-        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y, 0, 0);
-        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X, 0, 0);
-        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y, 0, 0);
+        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X+g_linux_joystick_config.lxstick, 0, 0);
+        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X+g_linux_joystick_config.lystick, 0, 0);
+        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X+g_linux_joystick_config.rxstick, 0, 0);
+        pad.m_sticks.emplace_back(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X+g_linux_joystick_config.rystick, 0, 0);
     }
 
     update_devs();
-    thread_ctrl::spawn("linux-joystick-handler", std::bind(&LinuxJoystickHandler::thread_func, this));
+    active.store(true);
+    joy_thread.reset(new std::thread(std::bind(&LinuxJoystickHandler::thread_func, this)));
 }
 
 void LinuxJoystickHandler::update_devs()
@@ -114,17 +113,20 @@ bool LinuxJoystickHandler::try_open_dev(u32 index)
 
     const auto& path = joy_paths[index];
 
-    if (!fs::exists(path))
+    if (access(path.c_str(), R_OK) == -1)
     {
         if (was_connected)
+        {
             // It was disconnected.
             m_pads[index].m_port_status |= CELL_PAD_STATUS_ASSIGN_CHANGES;
+
+            int fd = libevdev_get_fd(dev);
+            libevdev_free(dev);
+            close(fd);
+        }
         m_pads[index].m_port_status &= ~CELL_PAD_STATUS_CONNECTED;
-        LOG_ERROR(GENERAL, "Joystick %s is not present [previous status: %d]", path.c_str(),
+        LOG_ERROR(GENERAL, "Joystick %s is not present or accessible [previous status: %d]", path.c_str(),
                   was_connected ? 1 : 0);
-        int fd = libevdev_get_fd(dev);
-        libevdev_free(dev);
-        close(fd);
         return false;
     }
 
@@ -160,6 +162,22 @@ bool LinuxJoystickHandler::try_open_dev(u32 index)
             joy_button_maps[index][i - BTN_MISC] = buttons++;
         }
 
+    int axes=0;
+    for (int i=ABS_X; i<=ABS_RZ; i++)
+        if (libevdev_has_event_code(dev, EV_ABS, i))
+        {
+            LOG_NOTICE(GENERAL, "Joystick #%d has axis %d as %d", index, i, axes);
+            joy_axis_maps[index][i - ABS_X] = axes++;
+        }
+
+    for (int i=ABS_HAT0X; i<=ABS_HAT3Y; i+=2)
+        if (libevdev_has_event_code(dev, EV_ABS, i) ||
+            libevdev_has_event_code(dev, EV_ABS, i+1))
+        {
+            LOG_NOTICE(GENERAL, "Joystick #%d has hat %d", index, i);
+            joy_hat_ids[index] = i - ABS_HAT0X;
+        }
+
     return true;
 }
 
@@ -169,10 +187,14 @@ void LinuxJoystickHandler::Close()
     {
         active.store(false);
         if (!dead.load())
-            if (!thread_ctrl::wait_for(milli2nano(THREAD_TIMEOUT)))
+        {
+            usleep(milli2micro(THREAD_TIMEOUT));
+            if (!dead.load())
                 LOG_ERROR(GENERAL, "LinuxJoystick thread could not stop within %d milliseconds", THREAD_TIMEOUT);
-        dead.store(false);
+        }
     }
+
+    joy_thread->detach();
 
     for (auto& dev : joy_devs)
     {
@@ -187,10 +209,6 @@ void LinuxJoystickHandler::Close()
 
 void LinuxJoystickHandler::thread_func()
 {
-    struct timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = milli2nano(READ_TIMEOUT);
-
     while (active)
     {
         update_devs();
@@ -221,8 +239,12 @@ void LinuxJoystickHandler::thread_func()
 
             switch (evt.type)
             {
+            case EV_SYN:
+                LOG_NOTICE(GENERAL, "Joystick #%d sent EV_SYN", i);
+                break;
             case EV_KEY:
             {
+                LOG_NOTICE(GENERAL, "Joystick #%d EV_KEY: %d %d", i, evt.code, evt.value);
                 if (evt.code < BTN_MISC)
                 {
                     LOG_NOTICE(GENERAL, "Joystick #%d sent non-button key event %d", i, evt.code);
@@ -248,19 +270,62 @@ void LinuxJoystickHandler::thread_func()
                 which_button->m_value = evt.value ? 255 : 0;
                 break;
             }
-            case EV_ABS: {
-                if (evt.code > ABS_HAT3Y || evt.code < ABS_HAT0X) break;
-                int axis = evt.code - ABS_HAT0X;
+            case EV_ABS:
+                LOG_NOTICE(GENERAL, "Joystick #%d EV_ABS: %d %d", i, evt.code, evt.value);
 
-                if (axis > pad.m_sticks.size())
-                {
-                    LOG_ERROR(GENERAL, "Joystick #%d sent axis event for invalid axis %d", i, axis);
-                    break;
+                if (evt.code >= ABS_HAT0X && evt.code <= ABS_HAT3Y) {
+                    int hat = evt.code - ABS_HAT0X;
+                    if (hat != joy_hat_ids[i] && hat-1 != joy_hat_ids[i])
+                    {
+                        LOG_ERROR(GENERAL, "Joystick #%d sent HAT event for invalid hat %d (expected %d)", i, hat, joy_hat_ids[i]);
+                        break;
+                    }
+
+                    int source_axis = hat == joy_hat_ids[i] ? DPAD_AXIS_X : DPAD_AXIS_Y;
+
+                    for (Button& bt : pad.m_buttons)
+                    {
+                        if (bt.m_keyCode != source_axis) continue;
+
+                        if (evt.value == 0)
+                        {
+                            bt.m_pressed = false;
+                            bt.m_value = 0;
+                        }
+                        else
+                        {
+                            int code = -1;
+                            if (source_axis == DPAD_AXIS_X)
+                            {
+                                code = evt.value > 0 ? CELL_PAD_CTRL_RIGHT : CELL_PAD_CTRL_LEFT;
+                            }
+                            else
+                            {
+                                code = evt.value > 0 ? CELL_PAD_CTRL_DOWN : CELL_PAD_CTRL_UP;
+                            }
+
+                            if (bt.m_outKeyCode == code)
+                            {
+                                bt.m_pressed = true;
+                                bt.m_value = 255;
+                            }
+                        }
+                    }
                 }
+                else if (evt.code <= ABS_RZ)
+                {
+                    int axis = joy_axis_maps[i][evt.code - ABS_X];
 
-                pad.m_sticks[axis].m_value = ConvertAxis(evt.value);
+                    if (axis > pad.m_sticks.size())
+                    {
+                        LOG_ERROR(GENERAL, "Joystick #%d sent axis event for invalid axis %d", i, axis);
+                        break;
+                    }
+
+                    auto& stick = pad.m_sticks[axis];
+                    stick.m_value = evt.value;
+                }
                 break;
-            }
             default:
                 LOG_ERROR(GENERAL, "Unknown joystick #%d event %d", i, evt.type);
                 break;

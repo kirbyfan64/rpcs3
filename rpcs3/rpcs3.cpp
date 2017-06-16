@@ -94,7 +94,7 @@ cfg::map_entry<std::function<std::shared_ptr<PadHandlerBase>()>> g_cfg_pad_handl
 	{ "XInput", &std::make_shared<XInputPadHandler> },
 	{ "MMJoystick", &std::make_shared<MMJoystickHandler>},
 #endif
-#ifdef __linux_
+#ifdef __linux__
 	{ "LinuxJoystick", &std::make_shared<LinuxJoystickHandler>},
 #endif
 });
@@ -134,7 +134,7 @@ bool Rpcs3App::OnInit()
 		{ wxCMD_LINE_PARAM, NULL, NULL, "(S)ELF", wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL },
 		{ wxCMD_LINE_NONE }
 	};
-	
+
 	parser.SetDesc(desc);
 	parser.SetCmdLine(argc, argv);
 
@@ -234,7 +234,7 @@ void Rpcs3App::OnArguments(const wxCmdLineParser& parser)
 		g_cfg_autostart = true;
 		g_cfg_autoexit = true;
 	}
-	
+
 	if (parser.GetParamCount() > 0)
 	{
 		Emu.SetPath(fmt::ToUTF8(parser.GetParam(0)));
