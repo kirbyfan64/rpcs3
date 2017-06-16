@@ -64,4 +64,5 @@ private:
     mutable atomic_t<bool> active{false}, dead{false};
     std::vector<std::string> joy_paths;
     std::vector<libevdev*> joy_devs;
+    std::vector<std::vector<int>> joy_button_maps;
 };

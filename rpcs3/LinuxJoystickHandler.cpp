@@ -22,7 +22,6 @@ namespace
     const u32 THREAD_TIMEOUT = 1000;
 
     const std::string EVENT_JOYSTICK = "event-joystick";
-    const std::string THREAD_NAME = "linux-joystick-handler";
 
     // From XInputPadHandler.cpp
     inline u16 ConvertAxis(short value)
@@ -60,6 +59,7 @@ void LinuxJoystickHandler::Init(const u32 max_connect)
     for (u32 i = 0; i < m_info.max_connect; ++i)
     {
         joy_devs.push_back(nullptr);
+        joy_button_maps.emplace_back(KEY_MAX - BTN_JOYSTICK, -1);
         m_pads.emplace_back(
             CELL_PAD_STATUS_DISCONNECTED,
             CELL_PAD_SETTING_PRESS_OFF | CELL_PAD_SETTING_SENSOR_OFF,
@@ -94,7 +94,7 @@ void LinuxJoystickHandler::Init(const u32 max_connect)
     }
 
     update_devs();
-    thread_ctrl::spawn(THREAD_NAME, std::bind(&LinuxJoystickHandler::thread_func, this));
+    thread_ctrl::spawn("linux-joystick-handler", std::bind(&LinuxJoystickHandler::thread_func, this));
 }
 
 void LinuxJoystickHandler::update_devs()
@@ -151,6 +151,15 @@ bool LinuxJoystickHandler::try_open_dev(u32 index)
         // Connection status changed from disconnected to connected.
         m_pads[index].m_port_status |= CELL_PAD_STATUS_ASSIGN_CHANGES;
     m_pads[index].m_port_status |= CELL_PAD_STATUS_CONNECTED;
+
+    int buttons=0;
+    for (int i=BTN_JOYSTICK; i<KEY_MAX; i++)
+        if (libevdev_has_event_code(dev, EV_KEY, i))
+        {
+            LOG_NOTICE(GENERAL, "Joystick #%d has button %d as %d", index, i, buttons);
+            joy_button_maps[index][i - BTN_MISC] = buttons++;
+        }
+
     return true;
 }
 
@@ -212,15 +221,26 @@ void LinuxJoystickHandler::thread_func()
 
             switch (evt.type)
             {
-            case EVT_KEY:
+            case EV_KEY:
             {
+                if (evt.code < BTN_MISC)
+                {
+                    LOG_NOTICE(GENERAL, "Joystick #%d sent non-button key event %d", i, evt.code);
+                    break;
+                }
+
+                int button_code = joy_button_maps[i][evt.code - BTN_MISC];
+                if (button_code == -1)
+                {
+                    LOG_ERROR(GENERAL, "Joystick #%d sent invalid button code %d", i, evt.code);
+                }
+
                 auto which_button = std::find_if(
                     pad.m_buttons.begin(), pad.m_buttons.end(),
-                    [&](const Button& bt) { return bt.m_keyCode == evt.number; });
+                    [&](const Button& bt) { return bt.m_keyCode == button_code; });
                 if (which_button == pad.m_buttons.end())
                 {
-                    LOG_ERROR(GENERAL, "Joystick %s sent button event for invalid button %d",
-                              path.c_str(), evt.number);
+                    LOG_ERROR(GENERAL, "Joystick #%d sent button event for invalid button %d", i, evt.code);
                     break;
                 }
 
@@ -228,7 +248,7 @@ void LinuxJoystickHandler::thread_func()
                 which_button->m_value = evt.value ? 255 : 0;
                 break;
             }
-            case EVT_ABS: {
+            case EV_ABS: {
                 if (evt.code > ABS_HAT3Y || evt.code < ABS_HAT0X) break;
                 int axis = evt.code - ABS_HAT0X;
 
